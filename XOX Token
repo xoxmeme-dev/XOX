@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.31;
+
+import "@openzeppelin/contracts@5.1.0/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts@5.1.0/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts@5.1.0/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts@5.1.0/access/Ownable2Step.sol";
+import "@openzeppelin/contracts@5.1.0/utils/Pausable.sol";
+import "@openzeppelin/contracts@5.1.0/utils/ReentrancyGuard.sol";
+
+/**
+ * @title XOX Token (XOX)
+ * @notice ERC20 token implementation for the XOX MEME project.
+ * @dev Implements fixed supply, rate-limited airdrops, and emergency controls.
+ *
+ * Security Architecture:
+ * - Access Control: Implements Ownable2Step to mitigate accidental ownership transfer risks.
+ * - Asset Safety: Utilizes SafeERC20 for emergency asset recovery transfers.
+ * - Risk Management: Enforces rate limiting (24h cooldown) and batch limits on airdrops.
+ * - Emergency Protocols: Pausable transfers and reentrancy protection on critical functions.
+ */
+contract XOX is ERC20, Ownable2Step, Pausable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // =============================================================
+    //                           CONSTANTS
+    // =============================================================
+
+    /// @dev Total fixed supply: 1,000,000,000 XOX (18 decimals).
+    uint256 private constant INITIAL_SUPPLY = 1_000_000_000 * 10**18;
+
+    /// @dev Maximum number of recipients allowed in a single airdrop transaction.
+    uint256 private constant MAX_AIRDROP_BATCH_SIZE = 100;
+
+    /// @dev Cooldown period required between airdrops for the same recipient.
+    uint256 private constant AIRDROP_COOLDOWN = 24 hours;
+
+    // Standardized Error Messages (String Constants for consistency)
+    string private constant ERR_LEN_MISMATCH = "XOX: Arrays length mismatch";
+    string private constant ERR_BATCH_SIZE = "XOX: Batch size too large";
+    string private constant ERR_INSUFFICIENT_BAL = "XOX: Insufficient balance";
+    string private constant ERR_INVALID_RECIPIENT = "XOX: Invalid recipient";
+    string private constant ERR_COOLDOWN = "XOX: Recipient in cooldown";
+    string private constant ERR_ZERO_AMOUNT = "XOX: Amount must be greater than 0";
+    string private constant ERR_ZERO_ADDRESS = "XOX: Address cannot be zero";
+    string private constant ERR_NO_TOKENS = "XOX: No tokens to withdraw";
+    string private constant ERR_NO_BNB = "XOX: No BNB to withdraw";
+    string private constant ERR_BNB_FAIL = "XOX: BNB Transfer failed";
+
+    // =============================================================
+    //                            STORAGE
+    // =============================================================
+
+    /// @dev Mapping to track the timestamp when a recipient is eligible for the next airdrop.
+    mapping(address => uint256) private nextAirdropAvailable;
+
+    // =============================================================
+    //                            EVENTS
+    // =============================================================
+
+    event TokensBurned(address indexed burner, uint256 amount, uint256 currentTotalSupply);
+    event Airdrop(address indexed recipient, uint256 amount, uint256 nextUnlockTime);
+    event EmergencyTokensWithdrawn(address indexed owner, address indexed token, uint256 amount);
+    event EmergencyBNBWithdrawn(address indexed owner, uint256 amount);
+
+    // =============================================================
+    //                          CONSTRUCTOR
+    // =============================================================
+
+    /**
+     * @dev Initializes the contract and mints the total supply to the deployer.
+     * Validated for OpenZeppelin v5.0 inheritance structure.
+     */
+    constructor() ERC20("XOX", "XOX") Ownable(msg.sender) {
+        _mint(msg.sender, INITIAL_SUPPLY);
+    }
+
+    // =============================================================
+    //                       CORE FUNCTIONS
+    // =============================================================
+
+    /**
+     * @dev Destroys a specific amount of tokens from the caller's address.
+     * @param amount The amount of tokens to burn.
+     * Requirements:
+     * - Only the owner can burn tokens (Strict Access Control).
+     * - The contract must not be paused.
+     * - Caller must have at least `amount` tokens.
+     */
+    function burn(uint256 amount) external onlyOwner whenNotPaused nonReentrant {
+        require(amount > 0, ERR_ZERO_AMOUNT);
+        require(balanceOf(msg.sender) >= amount, ERR_INSUFFICIENT_BAL);
+
+        _burn(msg.sender, amount);
+        emit TokensBurned(msg.sender, amount, totalSupply());
+    }
+
+    /**
+     * @dev Distributes tokens to multiple recipients efficiently.
+     * NOTE: Atomic execution. If one recipient fails (e.g., cooldown), the entire batch reverts.
+     * @param recipients Array of recipient addresses.
+     * @param amounts Array of token amounts to distribute.
+     */
+    function bulkAirdrop(
+        address[] calldata recipients,
+        uint256[] calldata amounts
+    ) external onlyOwner whenNotPaused nonReentrant {
+        require(recipients.length == amounts.length, ERR_LEN_MISMATCH);
+        require(recipients.length <= MAX_AIRDROP_BATCH_SIZE, ERR_BATCH_SIZE);
+
+        uint256 len = recipients.length;
+        uint256 totalAmount = 0;
+
+        // Verify total balance requirement
+        for (uint256 i = 0; i < len; i++) {
+            totalAmount += amounts[i];
+        }
+        require(balanceOf(msg.sender) >= totalAmount, ERR_INSUFFICIENT_BAL);
+
+        // Execute transfers and update cooldowns
+        for (uint256 i = 0; i < len; i++) {
+            address recipient = recipients[i];
+            uint256 amount = amounts[i];
+
+            require(recipient != address(0), ERR_INVALID_RECIPIENT);
+            require(amount > 0, ERR_ZERO_AMOUNT);
+            require(block.timestamp >= nextAirdropAvailable[recipient], ERR_COOLDOWN);
+
+            _transfer(msg.sender, recipient, amount);
+
+            uint256 nextUnlock = block.timestamp + AIRDROP_COOLDOWN;
+            nextAirdropAvailable[recipient] = nextUnlock;
+
+            emit Airdrop(recipient, amount, nextUnlock);
+        }
+    }
+
+    // =============================================================
+    //                      VIEW FUNCTIONS
+    // =============================================================
+
+    /**
+     * @dev Returns the remaining cooldown time for a specific address.
+     * @param account The address to check.
+     * @return remainingTime The time in seconds until the next airdrop is available (0 if available now).
+     */
+    function getRemainingCooldown(address account) external view returns (uint256 remainingTime) {
+        uint256 unlockTime = nextAirdropAvailable[account];
+        if (block.timestamp >= unlockTime) {
+            return 0;
+        }
+        return unlockTime - block.timestamp;
+    }
+
+    // =============================================================
+    //                      ADMIN & SECURITY
+    // =============================================================
+
+    /**
+     * @dev Pauses all token transfers.
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @dev Unpauses all token transfers.
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /**
+     * @dev Recovers ERC20 tokens sent to the contract address.
+     * @param tokenAddress The contract address of the token to recover.
+     * Uses SafeERC20 to ensure compatibility with non-standard tokens.
+     */
+    function emergencyWithdrawTokens(address tokenAddress) external onlyOwner nonReentrant {
+        require(tokenAddress != address(0), ERR_ZERO_ADDRESS);
+
+        IERC20 token = IERC20(tokenAddress);
+        uint256 balance = token.balanceOf(address(this));
+        require(balance > 0, ERR_NO_TOKENS);
+
+        token.safeTransfer(owner(), balance);
+
+        emit EmergencyTokensWithdrawn(owner(), tokenAddress, balance);
+    }
+
+    /**
+     * @dev Recovers native coins (BNB) sent to the contract address.
+     */
+    function withdrawStuckBNB() external onlyOwner nonReentrant {
+        uint256 balance = address(this).balance;
+        require(balance > 0, ERR_NO_BNB);
+
+        (bool success, ) = payable(owner()).call{value: balance}("");
+        require(success, ERR_BNB_FAIL);
+
+        emit EmergencyBNBWithdrawn(owner(), balance);
+    }
+
+    // =============================================================
+    //                        OVERRIDES
+    // =============================================================
+
+    /**
+     * @dev Hook that is called before any transfer of tokens.
+     * Checks if the contract is paused.
+     */
+    function _update(address from, address to, uint256 value) internal override(ERC20) whenNotPaused {
+        super._update(from, to, value);
+    }
+
+    // =============================================================
+    //                    FALLBACK FUNCTIONS
+    // =============================================================
+
+    /**
+     * @dev Prevents direct BNB transfers to the contract.
+     */
+    receive() external payable {
+        revert("XOX: Direct BNB transfer not allowed");
+    }
+
+    fallback() external payable {
+        revert("XOX: Direct BNB transfer not allowed");
+    }
+}
