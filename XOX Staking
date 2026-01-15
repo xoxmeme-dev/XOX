@@ -1,0 +1,263 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.31;
+
+import "@openzeppelin/contracts@5.1.0/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts@5.1.0/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts@5.1.0/access/Ownable2Step.sol";
+import "@openzeppelin/contracts@5.1.0/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts@5.1.0/utils/Pausable.sol";
+import "@openzeppelin/contracts@5.1.0/utils/math/Math.sol";
+
+/**
+ * @title XOX Staking
+ * @notice Staking contract for XOX tokens featuring basic and fixed-term vaults.
+ * @dev Implements a secure reward system where the admin can deposit but cannot withdraw staking tokens.
+ */
+contract XOX_STAKING is Ownable2Step, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+    using Math for uint256;
+
+    // =============================================================
+    //                           CONSTANTS
+    // =============================================================
+
+    IERC20 public immutable stakingToken;
+
+    uint256 private constant PRECISION_DIVISOR = 10000; // 100.00%
+    uint256 private constant SECONDS_IN_YEAR = 365 days;
+
+    // Withdrawal Delays
+    uint256 private constant DELAY_STANDARD = 24 hours; // Basic & Matured
+    uint256 private constant DELAY_EARLY = 72 hours;    // Early Withdrawal
+
+    // =============================================================
+    //                          CUSTOM ERRORS
+    // =============================================================
+
+    error InvalidTokenAddress();
+    error InvalidVaultId();
+    error VaultNotActive();
+    error AmountZero();
+    error AmountBelowMin(uint256 minRequired);
+    error AmountExceedsMax(uint256 maxAllowed);
+    error AlreadyStaked();
+    error NoActiveStake();
+    error RequestAlreadySubmitted();
+    error RequestNotSubmitted();
+    error WaitPeriodNotOver(uint256 claimableAt);
+    error InsufficientRewardPool();
+    error CannotWithdrawStakingToken();
+
+    // =============================================================
+    //                       DATA STRUCTURES
+    // =============================================================
+
+    struct Vault {
+        uint256 apy;             // Annual Percentage Yield (e.g., 250 = 2.5%)
+        uint256 lockupPeriod;    // Lock-up duration in seconds
+        uint256 minDeposit;      // Minimum deposit amount
+        uint256 maxDeposit;      // Maximum deposit amount
+        bool active;             // Status for new deposits
+    }
+
+    struct Stake {
+        uint256 amount;
+        uint256 startTime;
+        uint256 unlockTime;           // Timestamp when funds become claimable
+        uint256 rewardsStopTimestamp; // Timestamp used for reward calculation
+        bool isEarlyWithdrawal;       // Indicates if the withdrawal is subject to penalty
+    }
+
+    // =============================================================
+    //                            STORAGE
+    // =============================================================
+
+    Vault[] public vaults;
+    mapping(address => mapping(uint256 => Stake)) public userStakes;
+    
+    uint256 public totalStaked;
+    uint256 public rewardPool;
+
+    // =============================================================
+    //                            EVENTS
+    // =============================================================
+
+    event Staked(address indexed user, uint256 indexed vaultId, uint256 amount);
+    event WithdrawalRequested(address indexed user, uint256 indexed vaultId, uint256 unlockTime);
+    event Claimed(address indexed user, uint256 indexed vaultId, uint256 principal, uint256 rewards);
+    event RewardDeposited(address indexed depositor, uint256 amount);
+    event VaultStatusUpdated(uint256 indexed vaultId, bool isActive);
+
+    // =============================================================
+    //                          CONSTRUCTOR
+    // =============================================================
+
+    /**
+     * @dev Initializes the contract and configures default vaults.
+     * Vaults: Basic (2.5%), 90 Days (4%), 180 Days (6%), 365 Days (15%).
+     */
+    constructor(address _stakingToken) Ownable(msg.sender) {
+        if (_stakingToken == address(0)) revert InvalidTokenAddress();
+        stakingToken = IERC20(_stakingToken);
+
+        // Vault 0: Basic Pool (2.5%) - Min 5,000, Max 2,500,000
+        vaults.push(Vault(250, 0, 5000 * 10**18, 2500000 * 10**18, true));
+        
+        // Vault 1: 90 Days (4.0%) - Min 10,000, Max 2,500,000
+        vaults.push(Vault(400, 90 days, 10000 * 10**18, 2500000 * 10**18, true));
+        
+        // Vault 2: 180 Days (6.0%) - Min 10,000, Max 2,500,000
+        vaults.push(Vault(600, 180 days, 10000 * 10**18, 2500000 * 10**18, true));
+        
+        // Vault 3: 365 Days (15.0%) - Min 10,000, Max 2,500,000
+        vaults.push(Vault(1500, 365 days, 10000 * 10**18, 2500000 * 10**18, true));
+    }
+
+    // =============================================================
+    //                        USER FUNCTIONS
+    // =============================================================
+
+    /**
+     * @dev Stakes tokens into a specific vault.
+     * Limits one active stake per vault per user.
+     */
+    function stake(uint256 _vaultId, uint256 _amount) external nonReentrant whenNotPaused {
+        if (_vaultId >= vaults.length) revert InvalidVaultId();
+        
+        Vault storage vault = vaults[_vaultId];
+        if (!vault.active) revert VaultNotActive();
+        if (_amount < vault.minDeposit) revert AmountBelowMin(vault.minDeposit);
+        if (_amount > vault.maxDeposit) revert AmountExceedsMax(vault.maxDeposit);
+        if (userStakes[msg.sender][_vaultId].amount > 0) revert AlreadyStaked();
+
+        stakingToken.safeTransferFrom(msg.sender, address(this), _amount);
+
+        userStakes[msg.sender][_vaultId] = Stake({
+            amount: _amount,
+            startTime: block.timestamp,
+            unlockTime: 0,
+            rewardsStopTimestamp: 0,
+            isEarlyWithdrawal: false
+        });
+
+        totalStaked += _amount;
+        emit Staked(msg.sender, _vaultId, _amount);
+    }
+
+    /**
+     * @dev Initiates the withdrawal process.
+     * Freezes the reward calculation time to the current block timestamp.
+     * Sets the unlock time based on whether the lock-up period has been met.
+     */
+    function requestWithdrawal(uint256 _vaultId) external nonReentrant {
+        Stake storage userStake = userStakes[msg.sender][_vaultId];
+        if (userStake.amount == 0) revert NoActiveStake();
+        if (userStake.unlockTime > 0) revert RequestAlreadySubmitted();
+
+        Vault storage vault = vaults[_vaultId];
+        uint256 delay;
+        bool isEarly = false;
+
+        if (vault.lockupPeriod > 0 && block.timestamp < userStake.startTime + vault.lockupPeriod) {
+            delay = DELAY_EARLY; 
+            isEarly = true;
+        } else {
+            delay = DELAY_STANDARD; 
+        }
+
+        userStake.unlockTime = block.timestamp + delay;
+        userStake.rewardsStopTimestamp = block.timestamp;
+        userStake.isEarlyWithdrawal = isEarly;
+
+        emit WithdrawalRequested(msg.sender, _vaultId, userStake.unlockTime);
+    }
+
+    /**
+     * @dev Finalizes the withdrawal after the wait period.
+     * Calculates rewards based on the time served up to the request timestamp.
+     * Applies APY tiers based on the actual duration for early withdrawals.
+     */
+    function claimWithdrawal(uint256 _vaultId) external nonReentrant {
+        Stake storage userStake = userStakes[msg.sender][_vaultId];
+        if (userStake.unlockTime == 0) revert RequestNotSubmitted();
+        if (block.timestamp < userStake.unlockTime) revert WaitPeriodNotOver(userStake.unlockTime);
+
+        uint256 principal = userStake.amount;
+        uint256 appliedAPY;
+
+        uint256 timeServed = userStake.rewardsStopTimestamp - userStake.startTime;
+
+        if (userStake.isEarlyWithdrawal) {
+            if (timeServed >= vaults[2].lockupPeriod) { 
+                appliedAPY = vaults[2].apy; // 6.0%
+            } else if (timeServed >= vaults[1].lockupPeriod) { 
+                appliedAPY = vaults[1].apy; // 4.0%
+            } else { 
+                appliedAPY = vaults[0].apy; // 2.5%
+            }
+        } else {
+            appliedAPY = vaults[_vaultId].apy;
+        }
+
+        uint256 rewards = (principal * appliedAPY * timeServed) / (PRECISION_DIVISOR * SECONDS_IN_YEAR);
+
+        if (rewardPool < rewards) revert InsufficientRewardPool();
+
+        rewardPool -= rewards;
+        totalStaked -= principal;
+        delete userStakes[msg.sender][_vaultId];
+
+        stakingToken.safeTransfer(msg.sender, principal + rewards);
+        emit Claimed(msg.sender, _vaultId, principal, rewards);
+    }
+
+    // =============================================================
+    //                       ADMIN FUNCTIONS
+    // =============================================================
+
+    /**
+     * @dev Deposits rewards into the pool.
+     */
+    function depositReward(uint256 _amount) external onlyOwner nonReentrant {
+        if (_amount == 0) revert AmountZero();
+        stakingToken.safeTransferFrom(msg.sender, address(this), _amount);
+        rewardPool += _amount;
+        emit RewardDeposited(msg.sender, _amount);
+    }
+
+    /**
+     * @dev Recovers tokens sent to the contract by mistake.
+     * Prevents withdrawal of the staking token to ensure user funds are protected.
+     */
+    function recoverForeignToken(address tokenAddress, uint256 amount) external onlyOwner {
+        if (tokenAddress == address(stakingToken)) revert CannotWithdrawStakingToken();
+        IERC20(tokenAddress).safeTransfer(owner(), amount);
+    }
+
+    function setVaultStatus(uint256 _vaultId, bool _isActive) external onlyOwner {
+        if (_vaultId >= vaults.length) revert InvalidVaultId();
+        vaults[_vaultId].active = _isActive;
+        emit VaultStatusUpdated(_vaultId, _isActive);
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    // =============================================================
+    //                      VIEW FUNCTIONS
+    // =============================================================
+
+    function getStakeInfo(address _user, uint256 _vaultId) external view returns (Stake memory) {
+        return userStakes[_user][_vaultId];
+    }
+
+    function getVaultInfo(uint256 _vaultId) external view returns (Vault memory) {
+        if (_vaultId >= vaults.length) revert InvalidVaultId();
+        return vaults[_vaultId];
+    }
+}
