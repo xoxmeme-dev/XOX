@@ -1,4 +1,4 @@
-# 🟣 XOX
+# 💎 XOX
 
 XOX is a meme-driven token deployed on BNB Smart Chain.
 
