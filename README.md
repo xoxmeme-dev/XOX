@@ -102,3 +102,4 @@ and can be reviewed via public explorers and this repository.
 
 - Website: https://xoxmeme.io/
 - Twitter/X: https://x.com/XOX_HQ
+- Telegram: https://t.me/xoxmain
