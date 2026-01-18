@@ -45,6 +45,9 @@ is secured via smart-contract-based lockups.
 - 4-year vesting period with 25% released annually
 - All lockups are enforced on-chain and publicly verifiable
 
+PinkSale Lock (on-chain record):  
+https://www.pinksale.finance/pinklock/bsc/record/1442238
+
 ---
 
 ## 🔒 Staking
