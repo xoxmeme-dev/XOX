@@ -1,6 +1,6 @@
 # 💎 XOX
 
-XOX is a meme-driven token deployed on BNB Smart Chain.
+XOX is a GameFi utility token deployed on BNB Smart Chain.
 
 ---
 
@@ -15,6 +15,35 @@ XOX is a meme-driven token deployed on BNB Smart Chain.
 - Address: 0x69aC3fe78c15DCb9dBB130fC47685b55c602e056  
 - BscScan:  
   https://bscscan.com/token/0x69aC3fe78c15DCb9dBB130fC47685b55c602e056  
+
+---
+
+## 🔢 Token Distribution
+
+The total supply of XOX is fixed at 1,000,000,000 tokens.
+
+- 35% — Staking Rewards  
+  Allocated for staking incentives.
+
+- 30% — Token Sale & Liquidity  
+  Reserved for future token sales and liquidity provisioning.
+
+- 30% — Game Platform Ecosystem  
+  Allocated for the development and operation of the game platform ecosystem.
+
+- 5% — Reserve  
+  Set aside as a contingency reserve.
+
+---
+
+## 🔐 Supply Management & Lockup
+
+To enhance transparency and reduce custody risk, a portion of the total supply
+is secured via smart-contract-based lockups.
+
+- 40% of the total supply is locked via PinkSale V2
+- 4-year vesting period with 25% released annually
+- All lockups are enforced on-chain and publicly verifiable
 
 ---
 
@@ -68,4 +97,5 @@ and can be reviewed via public explorers and this repository.
 
 ## 🔗 Official Link
 
+- Website: https://xoxmeme.io/
 - Twitter/X: https://x.com/XOX_HQ
