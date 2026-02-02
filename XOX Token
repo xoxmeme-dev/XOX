@@ -17,12 +17,13 @@ import "@openzeppelin/contracts@5.1.0/utils/ReentrancyGuard.sol";
  * - Fixed supply minted once at deployment.
  * - Permit (EIP-2612) enables gasless approvals via signatures.
  * - Batch airdrops support per-recipient cooldowns and batch sizing constraints.
- * - Transfers are pausable via a centralized transfer gate.
+ * - Airdrop recipient lists must not contain duplicates (operator-safety invariant).
+ * - Transfers are pausable via a centralized transfer gate that covers all token movements.
  * - Emergency recovery functions exist for assets accidentally sent to the contract.
  *
  * Security model:
  * - Ownership uses Ownable2Step to reduce accidental transfers.
- * - Pausing is enforced centrally in the transfer hook to cover all token movements.
+ * - Pausing is enforced centrally in the transfer hook to cover transfers, mint, and burn.
  * - Reentrancy protection is applied to admin flows that perform external calls.
  */
 contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
@@ -56,12 +57,23 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
     error NoBNBToWithdraw();
     error BNBTransferFailed();
 
+    /// @dev Revert when the recipients list contains a duplicate non-zero address.
+    error DuplicateRecipient(address recipient);
+
     // =============================================================
     //                            STORAGE
     // =============================================================
 
     /// @dev Timestamp after which an address may receive the next airdrop.
     mapping(address => uint256) private nextAirdropAvailable;
+
+    /**
+     * @dev Per-call duplicate detection without clearing storage:
+     * - airdropBatchNonce increments each call
+     * - seenInAirdropBatch[addr] == currentNonce implies addr already appeared in this call
+     */
+    uint256 private airdropBatchNonce;
+    mapping(address => uint256) private seenInAirdropBatch;
 
     // =============================================================
     //                            EVENTS
@@ -71,7 +83,7 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
     event Airdrop(address indexed recipient, uint256 amount, uint256 nextUnlockTime);
 
     /**
-     * @dev Emitted when a recipient entry is ignored during non-atomic airdrops.
+     * @dev Emitted when an entry is ignored during non-atomic airdrops.
      * reasonCode values:
      *  1 = zero address
      *  2 = zero amount
@@ -96,7 +108,7 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
      */
     constructor()
         ERC20("XOX", "XOX")
-        ERC20Permit("XOX") // EIP-2612 domain separator name
+        ERC20Permit("XOX")
         Ownable(msg.sender)
     {
         _mint(msg.sender, INITIAL_SUPPLY);
@@ -126,7 +138,7 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
 
     /**
      * @notice Executes a batch airdrop with strict atomicity.
-     * @dev If any recipient entry fails validation (including cooldown), the entire transaction reverts.
+     * @dev Any invalid entry causes a full revert.
      *
      * @param recipients Recipient addresses.
      * @param amounts Token amounts per recipient.
@@ -138,6 +150,7 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
      * - Batch size must not exceed MAX_AIRDROP_BATCH_SIZE.
      * - Owner must have sufficient balance for the entire validated batch sum.
      * - Each entry must satisfy: recipient != 0, amount > 0, cooldown passed.
+     * - Recipients must be unique within the batch (non-zero addresses).
      */
     function bulkAirdrop(
         address[] calldata recipients,
@@ -150,7 +163,8 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
         address sender = msg.sender;
         uint256 nowTs = block.timestamp;
 
-        // Validate entries while computing the exact total that will be transferred.
+        uint256 batchId = ++airdropBatchNonce;
+
         uint256 totalAmount;
         for (uint256 i = 0; i < len; ) {
             address recipient = recipients[i];
@@ -158,25 +172,27 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
 
             if (recipient == address(0)) revert InvalidRecipient();
             if (amount == 0) revert ZeroAmount();
+
+            if (seenInAirdropBatch[recipient] == batchId) revert DuplicateRecipient(recipient);
+            seenInAirdropBatch[recipient] = batchId;
+
             if (nowTs < nextAirdropAvailable[recipient]) revert RecipientInCooldown();
 
             totalAmount += amount;
-
             unchecked { ++i; }
         }
 
         if (balanceOf(sender) < totalAmount) revert InsufficientBalance();
 
-        // Execute transfers after full validation and funding check.
+        uint256 nextUnlock = nowTs + AIRDROP_COOLDOWN;
+
         for (uint256 i = 0; i < len; ) {
             address recipient = recipients[i];
             uint256 amount = amounts[i];
 
             _transfer(sender, recipient, amount);
 
-            uint256 nextUnlock = nowTs + AIRDROP_COOLDOWN;
             nextAirdropAvailable[recipient] = nextUnlock;
-
             emit Airdrop(recipient, amount, nextUnlock);
 
             unchecked { ++i; }
@@ -185,11 +201,13 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
 
     /**
      * @notice Executes a batch airdrop that tolerates invalid or ineligible entries.
-     * @dev Entries with a zero address, zero amount, or active cooldown are ignored, while eligible entries are processed.
+     * @dev Entries with a zero address, zero amount, or active cooldown are ignored.
      *
      * Funding rule:
-     * - The owner must have enough balance to cover the sum of all eligible entries; otherwise the call reverts.
-     *   This avoids partial completion caused by running out of tokens mid-loop.
+     * - The owner must have enough balance to cover the sum of eligible entries; otherwise the call reverts.
+     *
+     * Duplicate rule:
+     * - Duplicate non-zero recipients are treated as an operator error and cause a full revert.
      *
      * @param recipients Recipient addresses.
      * @param amounts Token amounts per recipient.
@@ -198,6 +216,7 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
      * - Caller must be the owner.
      * - Arrays must have equal length.
      * - Batch size must not exceed MAX_AIRDROP_BATCH_SIZE.
+     * - Recipients must be unique within the batch (non-zero addresses).
      * - Contract must not be paused (enforced in the transfer hook).
      */
     function bulkAirdropNonAtomic(
@@ -211,14 +230,20 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
         address sender = msg.sender;
         uint256 nowTs = block.timestamp;
 
-        // Precompute the total amount required for eligible recipients.
+        uint256 batchId = ++airdropBatchNonce;
+
         uint256 eligibleTotal;
         for (uint256 i = 0; i < len; ) {
             address recipient = recipients[i];
             uint256 amount = amounts[i];
 
-            if (recipient != address(0) && amount != 0 && nowTs >= nextAirdropAvailable[recipient]) {
-                eligibleTotal += amount;
+            if (recipient != address(0)) {
+                if (seenInAirdropBatch[recipient] == batchId) revert DuplicateRecipient(recipient);
+                seenInAirdropBatch[recipient] = batchId;
+
+                if (amount != 0 && nowTs >= nextAirdropAvailable[recipient]) {
+                    eligibleTotal += amount;
+                }
             }
 
             unchecked { ++i; }
@@ -226,16 +251,18 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
 
         if (balanceOf(sender) < eligibleTotal) revert InsufficientBalance();
 
-        // Process eligible entries and record skipped ones with reason codes.
+        uint256 nextUnlock = nowTs + AIRDROP_COOLDOWN;
+
         for (uint256 i = 0; i < len; ) {
             address recipient = recipients[i];
             uint256 amount = amounts[i];
 
+            // Skip zero-address silently to avoid operational confusion in off-chain monitoring.
             if (recipient == address(0)) {
-                emit AirdropSkipped(recipient, amount, SKIP_ZERO_ADDRESS);
                 unchecked { ++i; }
                 continue;
             }
+
             if (amount == 0) {
                 emit AirdropSkipped(recipient, amount, SKIP_ZERO_AMOUNT);
                 unchecked { ++i; }
@@ -249,9 +276,7 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
 
             _transfer(sender, recipient, amount);
 
-            uint256 nextUnlock = nowTs + AIRDROP_COOLDOWN;
             nextAirdropAvailable[recipient] = nextUnlock;
-
             emit Airdrop(recipient, amount, nextUnlock);
 
             unchecked { ++i; }
@@ -310,9 +335,10 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
         uint256 balance = token.balanceOf(address(this));
         if (balance == 0) revert NoTokensToWithdraw();
 
-        token.safeTransfer(owner(), balance);
+        address o = owner();
+        token.safeTransfer(o, balance);
 
-        emit EmergencyTokensWithdrawn(owner(), tokenAddress, balance);
+        emit EmergencyTokensWithdrawn(o, tokenAddress, balance);
     }
 
     /**
@@ -326,10 +352,11 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
         uint256 balance = address(this).balance;
         if (balance == 0) revert NoBNBToWithdraw();
 
-        (bool success, ) = payable(owner()).call{value: balance}("");
+        address o = owner();
+        (bool success, ) = payable(o).call{value: balance}("");
         if (!success) revert BNBTransferFailed();
 
-        emit EmergencyBNBWithdrawn(owner(), balance);
+        emit EmergencyBNBWithdrawn(o, balance);
     }
 
     // =============================================================
