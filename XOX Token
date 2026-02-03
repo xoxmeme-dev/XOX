@@ -85,9 +85,8 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
     /**
      * @dev Emitted when an entry is ignored during non-atomic airdrops.
      * reasonCode values:
-     *  1 = zero address
-     *  2 = zero amount
-     *  3 = cooldown active
+     *  1 = zero amount
+     *  2 = cooldown active
      */
     event AirdropSkipped(address indexed recipient, uint256 amount, uint8 reasonCode);
 
@@ -95,9 +94,8 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
     event EmergencyBNBWithdrawn(address indexed owner, uint256 amount);
 
     // Compact reason codes for AirdropSkipped
-    uint8 private constant SKIP_ZERO_ADDRESS = 1;
-    uint8 private constant SKIP_ZERO_AMOUNT  = 2;
-    uint8 private constant SKIP_COOLDOWN     = 3;
+    uint8 private constant SKIP_ZERO_AMOUNT = 1;
+    uint8 private constant SKIP_COOLDOWN    = 2;
 
     // =============================================================
     //                          CONSTRUCTOR
@@ -257,7 +255,7 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
             address recipient = recipients[i];
             uint256 amount = amounts[i];
 
-            // Skip zero-address silently to avoid operational confusion in off-chain monitoring.
+            // Silently skip zero address entries to avoid off-chain monitoring confusion.
             if (recipient == address(0)) {
                 unchecked { ++i; }
                 continue;
