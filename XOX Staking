@@ -1,392 +1,344 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.31;
 
-import "@openzeppelin/contracts@5.1.0/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts@5.1.0/token/ERC20/extensions/ERC20Permit.sol";
 import "@openzeppelin/contracts@5.1.0/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts@5.1.0/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts@5.1.0/access/Ownable2Step.sol";
-import "@openzeppelin/contracts@5.1.0/utils/Pausable.sol";
 import "@openzeppelin/contracts@5.1.0/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts@5.1.0/utils/Pausable.sol";
 
 /**
- * @title XOX Token — Fixed Supply ERC20 with Permit, Airdrops, and Emergency Controls
- * @notice XOX is a fixed-supply ERC20 token with EIP-2612 Permit, owner-operated airdrops, and emergency safety controls.
+ * @title XOX Staking
+ * @notice Staking contract for XOX tokens with four vaults and deterministic rewards.
  *
- * Design overview:
- * - Fixed supply minted once at deployment.
- * - Permit (EIP-2612) enables gasless approvals via signatures.
- * - Batch airdrops support per-recipient cooldowns and batch sizing constraints.
- * - Airdrop recipient lists must not contain duplicates (operator-safety invariant).
- * - Transfers are pausable via a centralized transfer gate that covers all token movements.
- * - Emergency recovery functions exist for assets accidentally sent to the contract.
+ * Policies:
+ * - Pausing blocks only new staking; withdrawal request, claim, and emergency exit remain available.
+ * - Principal-first payout: principal is always paid if the contract balance can cover it; rewards are paid up to the reward reserve.
+ * - Reward reserve is computed as: max(balanceOf(this) - totalStaked, 0).
  *
- * Security model:
- * - Ownership uses Ownable2Step to reduce accidental transfers.
- * - Pausing is enforced centrally in the transfer hook to cover transfers, mint, and burn.
- * - Reentrancy protection is applied to admin flows that perform external calls.
+ * Token handling:
+ * - Staked amount is recorded as the actual received amount to defensively support fee-on-transfer behavior.
  */
-contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
+contract XOX_STAKING is Ownable2Step, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     // =============================================================
     //                           CONSTANTS
     // =============================================================
 
-    /// @dev Total fixed supply: 1,000,000,000 XOX (18 decimals).
-    uint256 private constant INITIAL_SUPPLY = 1_000_000_000 * 10**18;
+    IERC20 public immutable stakingToken;
 
-    /// @dev Maximum number of recipients permitted in one airdrop call.
-    uint256 private constant MAX_AIRDROP_BATCH_SIZE = 100;
+    uint256 private constant PRECISION_DIVISOR = 10_000; // 100.00%
+    uint256 private constant SECONDS_IN_YEAR   = 365 days;
 
-    /// @dev Per-recipient airdrop cooldown duration.
-    uint256 private constant AIRDROP_COOLDOWN = 24 hours;
+    uint40 private constant DELAY_STANDARD = uint40(24 hours);
+    uint40 private constant DELAY_EARLY    = uint40(72 hours);
+
+    uint256 private constant MIN_DEPOSIT = 5_000 * 1e18;
+    uint256 private constant MAX_DEPOSIT = 5_000_000 * 1e18;
+
+    // APY in basis points (10_000 = 100%)
+    uint16 private constant APY_BASIC = 300;   // 3.00%
+    uint16 private constant APY_90D   = 500;   // 5.00%
+    uint16 private constant APY_180D  = 800;   // 8.00%
+    uint16 private constant APY_365D  = 1300;  // 13.00%
+
+    uint40 private constant LOCKUP_BASIC = 0;
+    uint40 private constant LOCKUP_90D   = uint40(90 days);
+    uint40 private constant LOCKUP_180D  = uint40(180 days);
+    uint40 private constant LOCKUP_365D  = uint40(365 days);
+
+    uint256 private constant VAULT_COUNT = 4;
+
+    uint8 private constant FLAG_EARLY = 1;
 
     // =============================================================
-    //                             ERRORS
+    //                          CUSTOM ERRORS
     // =============================================================
 
-    error LenMismatch();
-    error BatchSizeTooLarge();
-    error InsufficientBalance();
-    error InvalidRecipient();
-    error RecipientInCooldown();
-    error ZeroAmount();
-    error ZeroAddress();
-    error NoTokensToWithdraw();
-    error NoBNBToWithdraw();
-    error BNBTransferFailed();
+    error InvalidTokenAddress();
+    error InvalidVaultId();
+    error VaultNotActive();
+    error AmountZero();
+    error AmountBelowMin(uint256 minRequired);
+    error AmountExceedsMax(uint256 maxAllowed);
+    error AlreadyStaked();
+    error NoActiveStake();
+    error RequestAlreadySubmitted();
+    error RequestNotSubmitted();
+    error WaitPeriodNotOver(uint256 claimableAt);
+    error CannotWithdrawStakingToken();
+    error InsufficientContractBalance();
 
-    /// @dev Revert when the recipients list contains a duplicate non-zero address.
-    error DuplicateRecipient(address recipient);
+    // =============================================================
+    //                       DATA STRUCTURES
+    // =============================================================
+
+    struct Vault {
+        uint16 apy;      // annual yield in bps
+        uint40 lockup;   // lockup duration in seconds
+        bool   active;   // whether new stakes are allowed
+    }
+
+    /**
+     * @dev Packed into a single storage slot.
+     * - amount: uint128
+     * - start:  uint40
+     * - stop:   uint40
+     * - unlock: uint40
+     * - flags:  uint8
+     */
+    struct StakePacked {
+        uint128 amount;
+        uint40  start;
+        uint40  stop;
+        uint40  unlock;
+        uint8   flags;
+    }
 
     // =============================================================
     //                            STORAGE
     // =============================================================
 
-    /// @dev Timestamp after which an address may receive the next airdrop.
-    mapping(address => uint256) private nextAirdropAvailable;
+    Vault[VAULT_COUNT] public vaults;
 
-    /**
-     * @dev Per-call duplicate detection without clearing storage:
-     * - airdropBatchNonce increments each call
-     * - seenInAirdropBatch[addr] == currentNonce implies addr already appeared in this call
-     */
-    uint256 private airdropBatchNonce;
-    mapping(address => uint256) private seenInAirdropBatch;
+    mapping(address => mapping(uint256 => StakePacked)) private _stakes;
+
+    // Total staked principal tracked by the contract.
+    uint256 public totalStaked;
 
     // =============================================================
     //                            EVENTS
     // =============================================================
 
-    event TokensBurned(address indexed burner, uint256 amount, uint256 currentTotalSupply);
-    event Airdrop(address indexed recipient, uint256 amount, uint256 nextUnlockTime);
-
-    /**
-     * @dev Emitted when an entry is ignored during non-atomic airdrops.
-     * reasonCode values:
-     *  1 = zero amount
-     *  2 = cooldown active
-     */
-    event AirdropSkipped(address indexed recipient, uint256 amount, uint8 reasonCode);
-
-    event EmergencyTokensWithdrawn(address indexed owner, address indexed token, uint256 amount);
-    event EmergencyBNBWithdrawn(address indexed owner, uint256 amount);
-
-    // Compact reason codes for AirdropSkipped
-    uint8 private constant SKIP_ZERO_AMOUNT = 1;
-    uint8 private constant SKIP_COOLDOWN    = 2;
+    event Staked(address indexed user, uint256 indexed vaultId, uint256 amount);
+    event WithdrawalRequested(address indexed user, uint256 indexed vaultId, uint256 unlockTime, bool isEarly);
+    event Claimed(address indexed user, uint256 indexed vaultId, uint256 principal, uint256 rewardsPaid);
+    event RewardShortfall(address indexed user, uint256 indexed vaultId, uint256 rewardsOwed, uint256 rewardsPaid);
+    event EmergencyWithdrawn(address indexed user, uint256 indexed vaultId, uint256 principal);
+    event RewardDeposited(address indexed depositor, uint256 amount);
+    event VaultStatusUpdated(uint256 indexed vaultId, bool isActive);
 
     // =============================================================
     //                          CONSTRUCTOR
     // =============================================================
 
-    /**
-     * @dev Mints the full fixed supply to the deployer and initializes Permit.
-     */
-    constructor()
-        ERC20("XOX", "XOX")
-        ERC20Permit("XOX")
-        Ownable(msg.sender)
-    {
-        _mint(msg.sender, INITIAL_SUPPLY);
+    constructor(address stakingToken_) Ownable(msg.sender) {
+        if (stakingToken_ == address(0)) revert InvalidTokenAddress();
+        stakingToken = IERC20(stakingToken_);
+
+        vaults[0] = Vault({ apy: APY_BASIC, lockup: LOCKUP_BASIC, active: true });
+        vaults[1] = Vault({ apy: APY_90D,   lockup: LOCKUP_90D,   active: true });
+        vaults[2] = Vault({ apy: APY_180D,  lockup: LOCKUP_180D,  active: true });
+        vaults[3] = Vault({ apy: APY_365D,  lockup: LOCKUP_365D,  active: true });
     }
 
     // =============================================================
-    //                       CORE FUNCTIONS
+    //                        USER FUNCTIONS
     // =============================================================
 
     /**
-     * @notice Burns tokens from the owner's balance, reducing total supply.
-     * @param amount Amount of tokens to burn.
-     *
-     * Requirements:
-     * - Caller must be the owner.
-     * - Contract must not be paused.
-     * - amount must be greater than zero.
-     * - Owner must have at least amount tokens.
+     * @notice Stake into a vault. One active stake per user per vault.
+     * @dev Pausing blocks only this function.
      */
-    function burn(uint256 amount) external onlyOwner whenNotPaused {
-        if (amount == 0) revert ZeroAmount();
-        if (balanceOf(msg.sender) < amount) revert InsufficientBalance();
+    function stake(uint256 vaultId, uint256 amount) external nonReentrant whenNotPaused {
+        if (vaultId >= VAULT_COUNT) revert InvalidVaultId();
 
-        _burn(msg.sender, amount);
-        emit TokensBurned(msg.sender, amount, totalSupply());
+        Vault memory v = vaults[vaultId];
+        if (!v.active) revert VaultNotActive();
+
+        if (amount == 0) revert AmountZero();
+        if (amount < MIN_DEPOSIT) revert AmountBelowMin(MIN_DEPOSIT);
+        if (amount > MAX_DEPOSIT) revert AmountExceedsMax(MAX_DEPOSIT);
+
+        StakePacked storage s = _stakes[msg.sender][vaultId];
+        if (s.amount != 0) revert AlreadyStaked();
+
+        uint256 balBefore = stakingToken.balanceOf(address(this));
+        stakingToken.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 received = stakingToken.balanceOf(address(this)) - balBefore;
+
+        if (received == 0) revert AmountZero();
+        if (received < MIN_DEPOSIT) revert AmountBelowMin(MIN_DEPOSIT);
+        if (received > MAX_DEPOSIT) revert AmountExceedsMax(MAX_DEPOSIT);
+        if (received > type(uint128).max) revert AmountExceedsMax(MAX_DEPOSIT);
+
+        uint40 nowTs = uint40(block.timestamp);
+
+        s.amount = uint128(received);
+        s.start  = nowTs;
+        s.stop   = 0;
+        s.unlock = 0;
+        s.flags  = 0;
+
+        totalStaked += received;
+
+        emit Staked(msg.sender, vaultId, received);
     }
 
     /**
-     * @notice Executes a batch airdrop with strict atomicity.
-     * @dev Any invalid entry causes a full revert.
-     *
-     * @param recipients Recipient addresses.
-     * @param amounts Token amounts per recipient.
-     *
-     * Requirements:
-     * - Caller must be the owner.
-     * - Contract must not be paused.
-     * - Arrays must have equal length.
-     * - Batch size must not exceed MAX_AIRDROP_BATCH_SIZE.
-     * - Owner must have sufficient balance for the entire validated batch sum.
-     * - Each entry must satisfy: recipient != 0, amount > 0, cooldown passed.
-     * - Recipients must be unique within the batch (non-zero addresses).
+     * @notice Request withdrawal; reward accrual stops at request time.
      */
-    function bulkAirdrop(
-        address[] calldata recipients,
-        uint256[] calldata amounts
-    ) external onlyOwner {
-        uint256 len = recipients.length;
-        if (len != amounts.length) revert LenMismatch();
-        if (len > MAX_AIRDROP_BATCH_SIZE) revert BatchSizeTooLarge();
+    function requestWithdrawal(uint256 vaultId) external nonReentrant {
+        if (vaultId >= VAULT_COUNT) revert InvalidVaultId();
 
-        address sender = msg.sender;
-        uint256 nowTs = block.timestamp;
+        StakePacked storage s = _stakes[msg.sender][vaultId];
+        uint256 principal = uint256(s.amount);
+        if (principal == 0) revert NoActiveStake();
+        if (s.unlock != 0) revert RequestAlreadySubmitted();
 
-        uint256 batchId = ++airdropBatchNonce;
+        Vault memory v = vaults[vaultId];
+        uint40 nowTs = uint40(block.timestamp);
 
-        uint256 totalAmount;
-        for (uint256 i = 0; i < len; ) {
-            address recipient = recipients[i];
-            uint256 amount = amounts[i];
+        bool isEarly;
+        uint40 delay;
 
-            if (recipient == address(0)) revert InvalidRecipient();
-            if (amount == 0) revert ZeroAmount();
-
-            if (seenInAirdropBatch[recipient] == batchId) revert DuplicateRecipient(recipient);
-            seenInAirdropBatch[recipient] = batchId;
-
-            if (nowTs < nextAirdropAvailable[recipient]) revert RecipientInCooldown();
-
-            totalAmount += amount;
-            unchecked { ++i; }
+        if (v.lockup != 0 && nowTs < s.start + v.lockup) {
+            isEarly = true;
+            delay = DELAY_EARLY;
+            s.flags = s.flags | FLAG_EARLY;
+        } else {
+            isEarly = false;
+            delay = DELAY_STANDARD;
         }
 
-        if (balanceOf(sender) < totalAmount) revert InsufficientBalance();
+        s.stop   = nowTs;
+        s.unlock = nowTs + delay;
 
-        uint256 nextUnlock = nowTs + AIRDROP_COOLDOWN;
-
-        for (uint256 i = 0; i < len; ) {
-            address recipient = recipients[i];
-            uint256 amount = amounts[i];
-
-            _transfer(sender, recipient, amount);
-
-            nextAirdropAvailable[recipient] = nextUnlock;
-            emit Airdrop(recipient, amount, nextUnlock);
-
-            unchecked { ++i; }
-        }
+        emit WithdrawalRequested(msg.sender, vaultId, uint256(s.unlock), isEarly);
     }
 
     /**
-     * @notice Executes a batch airdrop that tolerates invalid or ineligible entries.
-     * @dev Entries with a zero address, zero amount, or active cooldown are ignored.
-     *
-     * Funding rule:
-     * - The owner must have enough balance to cover the sum of eligible entries; otherwise the call reverts.
-     *
-     * Duplicate rule:
-     * - Duplicate non-zero recipients are treated as an operator error and cause a full revert.
-     *
-     * @param recipients Recipient addresses.
-     * @param amounts Token amounts per recipient.
-     *
-     * Requirements:
-     * - Caller must be the owner.
-     * - Arrays must have equal length.
-     * - Batch size must not exceed MAX_AIRDROP_BATCH_SIZE.
-     * - Recipients must be unique within the batch (non-zero addresses).
-     * - Contract must not be paused (enforced in the transfer hook).
+     * @notice Claim principal plus rewards (rewards may be partial/zero if reserve is insufficient).
      */
-    function bulkAirdropNonAtomic(
-        address[] calldata recipients,
-        uint256[] calldata amounts
-    ) external onlyOwner {
-        uint256 len = recipients.length;
-        if (len != amounts.length) revert LenMismatch();
-        if (len > MAX_AIRDROP_BATCH_SIZE) revert BatchSizeTooLarge();
+    function claimWithdrawal(uint256 vaultId) external nonReentrant {
+        if (vaultId >= VAULT_COUNT) revert InvalidVaultId();
 
-        address sender = msg.sender;
-        uint256 nowTs = block.timestamp;
+        StakePacked storage s = _stakes[msg.sender][vaultId];
+        uint256 unlockTime = uint256(s.unlock);
+        if (unlockTime == 0) revert RequestNotSubmitted();
+        if (block.timestamp < unlockTime) revert WaitPeriodNotOver(unlockTime);
 
-        uint256 batchId = ++airdropBatchNonce;
+        uint256 principal = uint256(s.amount);
+        uint256 timeServed = uint256(s.stop) - uint256(s.start);
 
-        uint256 eligibleTotal;
-        for (uint256 i = 0; i < len; ) {
-            address recipient = recipients[i];
-            uint256 amount = amounts[i];
+        uint16 apy = _appliedApy(vaultId, (s.flags & FLAG_EARLY) != 0, timeServed);
+        uint256 rewardsOwed = (principal * uint256(apy) * timeServed) / (PRECISION_DIVISOR * SECONDS_IN_YEAR);
 
-            if (recipient != address(0)) {
-                if (seenInAirdropBatch[recipient] == batchId) revert DuplicateRecipient(recipient);
-                seenInAirdropBatch[recipient] = batchId;
+        uint256 contractBal = stakingToken.balanceOf(address(this));
+        if (contractBal < principal) revert InsufficientContractBalance();
 
-                if (amount != 0 && nowTs >= nextAirdropAvailable[recipient]) {
-                    eligibleTotal += amount;
-                }
-            }
+        uint256 stakedTotal = totalStaked;
 
-            unchecked { ++i; }
+        uint256 rewardReserve = 0;
+        if (contractBal > stakedTotal) rewardReserve = contractBal - stakedTotal;
+
+        uint256 rewardsPaid = rewardsOwed;
+        if (rewardsPaid > rewardReserve) {
+            rewardsPaid = rewardReserve;
+            emit RewardShortfall(msg.sender, vaultId, rewardsOwed, rewardsPaid);
         }
 
-        if (balanceOf(sender) < eligibleTotal) revert InsufficientBalance();
+        totalStaked = stakedTotal - principal;
+        delete _stakes[msg.sender][vaultId];
 
-        uint256 nextUnlock = nowTs + AIRDROP_COOLDOWN;
+        stakingToken.safeTransfer(msg.sender, principal + rewardsPaid);
 
-        for (uint256 i = 0; i < len; ) {
-            address recipient = recipients[i];
-            uint256 amount = amounts[i];
-
-            // Silently skip zero address entries to avoid off-chain monitoring confusion.
-            if (recipient == address(0)) {
-                unchecked { ++i; }
-                continue;
-            }
-
-            if (amount == 0) {
-                emit AirdropSkipped(recipient, amount, SKIP_ZERO_AMOUNT);
-                unchecked { ++i; }
-                continue;
-            }
-            if (nowTs < nextAirdropAvailable[recipient]) {
-                emit AirdropSkipped(recipient, amount, SKIP_COOLDOWN);
-                unchecked { ++i; }
-                continue;
-            }
-
-            _transfer(sender, recipient, amount);
-
-            nextAirdropAvailable[recipient] = nextUnlock;
-            emit Airdrop(recipient, amount, nextUnlock);
-
-            unchecked { ++i; }
-        }
+        emit Claimed(msg.sender, vaultId, principal, rewardsPaid);
     }
+
+    /**
+     * @notice Emergency exit: withdraw principal immediately and forfeit rewards.
+     */
+    function emergencyWithdraw(uint256 vaultId) external nonReentrant {
+        if (vaultId >= VAULT_COUNT) revert InvalidVaultId();
+
+        StakePacked storage s = _stakes[msg.sender][vaultId];
+        uint256 principal = uint256(s.amount);
+        if (principal == 0) revert NoActiveStake();
+
+        uint256 contractBal = stakingToken.balanceOf(address(this));
+        if (contractBal < principal) revert InsufficientContractBalance();
+
+        totalStaked -= principal;
+        delete _stakes[msg.sender][vaultId];
+
+        stakingToken.safeTransfer(msg.sender, principal);
+
+        emit EmergencyWithdrawn(msg.sender, vaultId, principal);
+    }
+
+    // =============================================================
+    //                       ADMIN FUNCTIONS
+    // =============================================================
+
+    function depositReward(uint256 amount) external onlyOwner nonReentrant {
+        if (amount == 0) revert AmountZero();
+        stakingToken.safeTransferFrom(msg.sender, address(this), amount);
+        emit RewardDeposited(msg.sender, amount);
+    }
+
+    function recoverForeignToken(address tokenAddress, uint256 amount) external onlyOwner {
+        if (tokenAddress == address(stakingToken)) revert CannotWithdrawStakingToken();
+        IERC20(tokenAddress).safeTransfer(owner(), amount);
+    }
+
+    function setVaultStatus(uint256 vaultId, bool isActive) external onlyOwner {
+        if (vaultId >= VAULT_COUNT) revert InvalidVaultId();
+        vaults[vaultId].active = isActive;
+        emit VaultStatusUpdated(vaultId, isActive);
+    }
+
+    function pause() external onlyOwner { _pause(); }
+    function unpause() external onlyOwner { _unpause(); }
 
     // =============================================================
     //                      VIEW FUNCTIONS
     // =============================================================
 
-    /**
-     * @notice Returns remaining cooldown time for an address.
-     * @param account Address to check.
-     * @return remainingTime Seconds until the address becomes eligible for the next airdrop (0 if eligible now).
-     */
-    function getRemainingCooldown(address account) external view returns (uint256 remainingTime) {
-        uint256 unlockTime = nextAirdropAvailable[account];
-        if (block.timestamp >= unlockTime) return 0;
-        return unlockTime - block.timestamp;
-    }
-
-    // =============================================================
-    //                      ADMIN & SECURITY
-    // =============================================================
-
-    /**
-     * @notice Pauses token transfers.
-     */
-    function pause() external onlyOwner {
-        _pause();
-    }
-
-    /**
-     * @notice Unpauses token transfers.
-     */
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-
-    /**
-     * @notice Recovers ERC20 tokens accidentally sent to this contract.
-     * @param tokenAddress Token contract address to recover.
-     *
-     * Requirements:
-     * - Caller must be the owner.
-     * - tokenAddress must not be zero.
-     * - Contract must hold a positive balance of the token.
-     *
-     * Reentrancy:
-     * - Protected because this function performs external calls to arbitrary token contracts.
-     */
-    function emergencyWithdrawTokens(address tokenAddress) external onlyOwner nonReentrant {
-        if (tokenAddress == address(0)) revert ZeroAddress();
-
-        IERC20 token = IERC20(tokenAddress);
-        uint256 balance = token.balanceOf(address(this));
-        if (balance == 0) revert NoTokensToWithdraw();
-
-        address o = owner();
-        token.safeTransfer(o, balance);
-
-        emit EmergencyTokensWithdrawn(o, tokenAddress, balance);
-    }
-
-    /**
-     * @notice Recovers native coins (e.g., BNB) that became stuck in this contract.
-     * @dev Native coins can be forced into a contract by certain EVM mechanics even if direct transfers are rejected.
-     *
-     * Reentrancy:
-     * - Protected because this function performs an external call with value.
-     */
-    function withdrawStuckBNB() external onlyOwner nonReentrant {
-        uint256 balance = address(this).balance;
-        if (balance == 0) revert NoBNBToWithdraw();
-
-        address o = owner();
-        (bool success, ) = payable(o).call{value: balance}("");
-        if (!success) revert BNBTransferFailed();
-
-        emit EmergencyBNBWithdrawn(o, balance);
-    }
-
-    // =============================================================
-    //                        OVERRIDES
-    // =============================================================
-
-    /**
-     * @dev Centralized transfer gate that enforces the paused state across all token movements.
-     */
-    function _update(address from, address to, uint256 value)
-        internal
-        override(ERC20)
-        whenNotPaused
+    function getStakeInfo(address user, uint256 vaultId)
+        external
+        view
+        returns (
+            uint256 amount,
+            uint256 startTime,
+            uint256 rewardsStopTimestamp,
+            uint256 unlockTime,
+            bool isEarlyWithdrawal
+        )
     {
-        super._update(from, to, value);
+        if (vaultId >= VAULT_COUNT) revert InvalidVaultId();
+        StakePacked memory s = _stakes[user][vaultId];
+
+        amount = uint256(s.amount);
+        startTime = uint256(s.start);
+        rewardsStopTimestamp = uint256(s.stop);
+        unlockTime = uint256(s.unlock);
+        isEarlyWithdrawal = (s.flags & FLAG_EARLY) != 0;
+    }
+
+    function getRewardReserve() external view returns (uint256) {
+        uint256 bal = stakingToken.balanceOf(address(this));
+        uint256 stakedTotal = totalStaked;
+        if (bal <= stakedTotal) return 0;
+        return bal - stakedTotal;
+    }
+
+    function getDepositBounds() external pure returns (uint256 minDeposit, uint256 maxDeposit) {
+        return (MIN_DEPOSIT, MAX_DEPOSIT);
     }
 
     // =============================================================
-    //                    FALLBACK FUNCTIONS
+    //                        INTERNAL LOGIC
     // =============================================================
 
-    /**
-     * @dev Rejects direct native coin transfers to reduce operational mistakes.
-     */
-    receive() external payable {
-        revert("XOX: Direct BNB transfer not allowed");
-    }
+    function _appliedApy(uint256 vaultId, bool isEarly, uint256 timeServed) internal view returns (uint16) {
+        if (!isEarly) {
+            return vaults[vaultId].apy;
+        }
 
-    /**
-     * @dev Rejects calls to unknown functions and direct native coin transfers.
-     */
-    fallback() external payable {
-        revert("XOX: Direct BNB transfer not allowed");
+        if (timeServed >= uint256(LOCKUP_180D)) return APY_180D;
+        if (timeServed >= uint256(LOCKUP_90D))  return APY_90D;
+        return APY_BASIC;
     }
 }
