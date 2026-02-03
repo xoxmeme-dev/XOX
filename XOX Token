@@ -153,7 +153,7 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
     function bulkAirdrop(
         address[] calldata recipients,
         uint256[] calldata amounts
-    ) external onlyOwner {
+    ) external onlyOwner whenNotPaused {
         uint256 len = recipients.length;
         if (len != amounts.length) revert LenMismatch();
         if (len > MAX_AIRDROP_BATCH_SIZE) revert BatchSizeTooLarge();
@@ -212,15 +212,15 @@ contract XOX is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
      *
      * Requirements:
      * - Caller must be the owner.
+     * - Contract must not be paused.
      * - Arrays must have equal length.
      * - Batch size must not exceed MAX_AIRDROP_BATCH_SIZE.
      * - Recipients must be unique within the batch (non-zero addresses).
-     * - Contract must not be paused (enforced in the transfer hook).
      */
     function bulkAirdropNonAtomic(
         address[] calldata recipients,
         uint256[] calldata amounts
-    ) external onlyOwner {
+    ) external onlyOwner whenNotPaused {
         uint256 len = recipients.length;
         if (len != amounts.length) revert LenMismatch();
         if (len > MAX_AIRDROP_BATCH_SIZE) revert BatchSizeTooLarge();
