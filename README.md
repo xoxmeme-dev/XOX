@@ -12,9 +12,9 @@ XOX is a GameFi utility token deployed on BNB Smart Chain.
 - Total Supply: 1,000,000,000 XOX  
 
 ### Token Contract
-- Address: 0x69aC3fe78c15DCb9dBB130fC47685b55c602e056  
+- Address: 0x50BE021b617c454806D3Aa870DAb3D8ac465322B  
 - BscScan:  
-  https://bscscan.com/token/0x69aC3fe78c15DCb9dBB130fC47685b55c602e056  
+  https://bscscan.com/token/0x50be021b617c454806d3aa870dab3d8ac465322b  
 
 ---
 
@@ -55,14 +55,13 @@ https://www.pinksale.finance/pinklock/bsc/record/1442238
 XOX staking is provided through a vault-based staking contract.
 
 ### Vaults
-- Vault 0: 2.5% APY, no lockup (basic)
-- Vault 1: 4.0% APY, 90-day lockup
-- Vault 2: 6.0% APY, 180-day lockup
-- Vault 3: 15.0% APY, 365-day lockup
+- Vault 0: 3.0% APY, no lockup (basic)
+- Vault 1: 5.0% APY, 90-day lockup
+- Vault 2: 8.0% APY, 180-day lockup
+- Vault 3: 13.0% APY, 365-day lockup
 
 Deposit limits (per vault):
-- Vault 0: min 5,000 XOX / max 2,500,000 XOX
-- Vault 1–3: min 10,000 XOX / max 2,500,000 XOX
+- Vault 0-3: min 5,000 XOX / max 5,000,000 XOX
 
 Each wallet can have one active stake per vault.
 
@@ -78,16 +77,16 @@ Waiting period:
 Rewards are calculated up to the withdrawal request time.
 
 Early withdrawal APY is applied based on the actual staking duration:
-- ≥ 180 days: 6.0%
-- ≥ 90 days: 4.0%
-- < 90 days: 2.5%
+- ≥ 180 days: 8.0%
+- ≥ 90 days: 5.0%
+- < 90 days: 3.0%
 
 ### Rewards
 Staking rewards are distributed from a predefined reward pool.
 No additional tokens are minted for rewards.
 
 ### Staking Contract
-- Address: 0x5e8E2597b28dc20e09F4c3e0892fC267aAA3e37d
+- Address: 0xbFC8D445e9E7e6558b581435E6E524827c2535bF
 
 ---
 
