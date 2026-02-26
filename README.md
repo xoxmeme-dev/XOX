@@ -97,6 +97,48 @@ and can be reviewed via public explorers and this repository.
 
 ---
 
+## 🔐 Security
+
+XOX smart contracts have undergone automated security assessments
+using SolidityScan (static analysis).
+
+### Summary
+
+- XOX Token
+  - Security Score: 91.70
+  - Critical: 0
+  - High: 0
+  - Medium: 1
+
+- XOX Staking
+  - Security Score: 93.37
+  - Critical: 0
+  - High: 0
+  - Medium: 1
+
+Findings are primarily low severity, informational, and gas optimization related.
+
+### Status
+
+- Findings are currently marked as "Pending Fix"
+- Most findings relate to best practices and optimizations
+- No critical or high-risk vulnerabilities identified
+
+### Reports
+
+- XOX Token Audit  
+  https://github.com/xoxmeme-dev/XOX/blob/main/XOX%20Token%20Scan.pdf  
+
+- XOX Staking Audit  
+  https://github.com/xoxmeme-dev/XOX/blob/main/XOX%20Staking%20Scan.pdf  
+
+### Note
+
+These reports are based on automated scanning and do not constitute
+a full manual audit.
+
+---
+
 ## 🔗 Official Link
 
 - Website: https://xoxmeme.io/
