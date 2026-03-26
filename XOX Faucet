@@ -1,0 +1,447 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.31;
+
+import "@openzeppelin/contracts@5.1.0/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts@5.1.0/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts@5.1.0/access/Ownable2Step.sol";
+
+/**
+ * @title XOX Faucet — Public Token Faucet with Cooldown, Lifetime Cap, and Admin Controls
+ * @notice Public faucet contract for the XOX token.
+ *
+ * Design overview:
+ * - Open public claim flow without project-issued signatures
+ * - Claim caller pays gas
+ * - Optional EOA-only mode using `msg.sender.code.length == 0`
+ * - Minimum native BNB balance requirement
+ * - Pseudo-random payout in the range of 5.00 to 12.50 XOX
+ * - Per-address cooldown and lifetime claim cap
+ * - Owner can fund, pause, blacklist, recover tokens, and withdraw stray BNB
+ *
+ * Notes:
+ * - Randomness is not secure randomness and is intended only for small faucet payouts
+ * - The token is assumed to use 18 decimals
+ */
+contract XOX_FAUCET is Ownable2Step {
+    using SafeERC20 for IERC20;
+
+    // -------------------------------------------------------------------------
+    // Errors
+    // -------------------------------------------------------------------------
+
+    error ZeroAddress();
+    error ZeroAmount();
+    error InvalidCooldown();
+    error InvalidRange();
+    error FaucetPaused();
+    error BlacklistedUser();
+    error OnlyEOAAllowed();
+    error InsufficientBNB();
+    error CooldownNotFinished(uint256 nextClaimAt);
+    error LifetimeCapExceeded();
+    error InsufficientFaucetBalance();
+    error BNBTransferFailed();
+    error MainTokenRecoveryNotAllowed();
+
+    // -------------------------------------------------------------------------
+    // Constants
+    // -------------------------------------------------------------------------
+
+    /// @dev XOX token unit for 18-decimal tokens.
+    uint256 public constant TOKEN_UNIT = 1e18;
+
+    /// @dev XOX claim unit for raw 0.01-token accounting.
+    uint256 public constant CLAIM_UNIT = TOKEN_UNIT / 100;
+
+    /// @dev Minimum caller BNB balance required to claim.
+    uint256 public constant MIN_BNB_BALANCE = 0.01 ether;
+
+    /// @dev Per-address lifetime claim cap: 5,500 XOX.
+    uint256 public constant LIFETIME_CAP = 5_500 * TOKEN_UNIT;
+
+    /// @dev Maximum allowed cooldown.
+    uint40 public constant MAX_COOLDOWN = 30 days;
+
+    /// @dev Reason code returned by canClaim(): claim available.
+    uint8 public constant CLAIM_OK = 0;
+    /// @dev Reason code returned by canClaim(): faucet paused.
+    uint8 public constant CLAIM_ERR_PAUSED = 1;
+    /// @dev Reason code returned by canClaim(): user blacklisted.
+    uint8 public constant CLAIM_ERR_BLACKLISTED = 2;
+    /// @dev Reason code returned by canClaim(): only EOA mode active.
+    uint8 public constant CLAIM_ERR_ONLY_EOA = 3;
+    /// @dev Reason code returned by canClaim(): insufficient BNB.
+    uint8 public constant CLAIM_ERR_BNB = 4;
+    /// @dev Reason code returned by canClaim(): cooldown active.
+    uint8 public constant CLAIM_ERR_COOLDOWN = 5;
+    /// @dev Reason code returned by canClaim(): lifetime cap reached.
+    uint8 public constant CLAIM_ERR_LIFETIME_CAP = 6;
+    /// @dev Reason code returned by canClaim(): faucet balance below required payout.
+    uint8 public constant CLAIM_ERR_FAUCET_BALANCE = 7;
+
+    // -------------------------------------------------------------------------
+    // Immutable state
+    // -------------------------------------------------------------------------
+
+    /// @notice XOX token distributed by this faucet.
+    IERC20 public immutable token;
+
+    // -------------------------------------------------------------------------
+    // Packed config state
+    // -------------------------------------------------------------------------
+
+    /**
+     * @notice Claim cooldown in seconds.
+     * @dev Default is 86,580 seconds (24 hours 3 minutes).
+     */
+    uint40 public cooldown = 86580;
+
+    /**
+     * @notice Minimum payout in raw 0.01-token units.
+     * @dev 500 = 5.00 XOX.
+     */
+    uint16 public minTokenCount = 500;
+
+    /**
+     * @notice Maximum payout in raw 0.01-token units.
+     * @dev 1250 = 12.50 XOX.
+     */
+    uint16 public maxTokenCount = 1250;
+
+    /**
+     * @notice When true, claims are restricted to EOAs.
+     * @dev Uses `msg.sender.code.length == 0` as a lightweight guard.
+     */
+    bool public onlyEOA = true;
+
+    /**
+     * @notice Global pause switch for claims.
+     */
+    bool public paused = false;
+
+    // -------------------------------------------------------------------------
+    // User state
+    // -------------------------------------------------------------------------
+
+    /// @notice Timestamp of the user's most recent successful claim.
+    mapping(address => uint256) public lastClaimed;
+
+    /// @notice Total amount claimed by a user across the faucet lifetime.
+    mapping(address => uint256) public totalClaimedByUser;
+
+    /// @notice Blacklist flag for abusive or disallowed addresses.
+    mapping(address => bool) public blacklisted;
+
+    // -------------------------------------------------------------------------
+    // Events
+    // -------------------------------------------------------------------------
+
+    event Claimed(
+        address indexed user,
+        uint256 tokenCountRaw,
+        uint256 amount,
+        uint256 claimedAt,
+        uint256 nextClaimAt,
+        uint256 totalClaimedAfter
+    );
+
+    event CooldownUpdated(uint256 newCooldown);
+    event TokenCountRangeUpdated(uint256 minTokens, uint256 maxTokens);
+    event PausedUpdated(bool isPaused);
+    event OnlyEOAUpdated(bool onlyEOA);
+    event TokensDeposited(address indexed from, uint256 amount);
+    event TokensWithdrawn(address indexed to, uint256 amount);
+    event EmergencyTokenRecovered(address indexed token, address indexed to, uint256 amount);
+    event EmergencyBNBWithdrawn(address indexed to, uint256 amount);
+    event BlacklistUpdated(address indexed user, bool isBlacklisted);
+
+    // -------------------------------------------------------------------------
+    // Constructor
+    // -------------------------------------------------------------------------
+
+    /**
+     * @param _token XOX token address distributed by the faucet.
+     */
+    constructor(address _token) Ownable(msg.sender) {
+        if (_token == address(0)) revert ZeroAddress();
+        token = IERC20(_token);
+    }
+
+    // -------------------------------------------------------------------------
+    // Claim logic
+    // -------------------------------------------------------------------------
+
+    /**
+     * @notice Claims a pseudo-random amount of XOX, subject to faucet rules.
+     *
+     * Requirements:
+     * - faucet must not be paused
+     * - caller must not be blacklisted
+     * - if `onlyEOA == true`, caller must have no deployed code
+     * - caller must hold at least 0.01 BNB
+     * - caller cooldown must have expired
+     * - caller must remain below the 5,500 XOX lifetime cap
+     *
+     * Notes:
+     * - payout randomness is not secure randomness
+     * - caller pays gas
+     */
+    function claim() external {
+        address user = msg.sender;
+
+        if (paused) revert FaucetPaused();
+        if (blacklisted[user]) revert BlacklistedUser();
+        if (onlyEOA && user.code.length != 0) revert OnlyEOAAllowed();
+        if (user.balance < MIN_BNB_BALANCE) revert InsufficientBNB();
+
+        uint256 last = lastClaimed[user];
+        uint256 nextClaimAt = last + uint256(cooldown);
+        if (block.timestamp < nextClaimAt) revert CooldownNotFinished(nextClaimAt);
+
+        uint256 remainingCap_ = _remainingCap(user);
+        if (remainingCap_ == 0) revert LifetimeCapExceeded();
+
+        uint256 tokenCountRaw = _randomTokenCount(user, last);
+        uint256 amount = tokenCountRaw * CLAIM_UNIT;
+
+        if (amount > remainingCap_) {
+            amount = remainingCap_;
+            tokenCountRaw = amount / CLAIM_UNIT;
+        }
+
+        if (amount == 0) revert ZeroAmount();
+        if (token.balanceOf(address(this)) < amount) revert InsufficientFaucetBalance();
+
+        uint256 claimedAfter = totalClaimedByUser[user] + amount;
+
+        lastClaimed[user] = block.timestamp;
+        totalClaimedByUser[user] = claimedAfter;
+
+        token.safeTransfer(user, amount);
+
+        emit Claimed(
+            user,
+            tokenCountRaw,
+            amount,
+            block.timestamp,
+            block.timestamp + uint256(cooldown),
+            claimedAfter
+        );
+    }
+
+    /**
+     * @notice Returns whether a user is currently eligible to claim.
+     * @dev `reasonCode` meanings:
+     * 0 = OK
+     * 1 = paused
+     * 2 = blacklisted
+     * 3 = only EOA mode active and user is a contract
+     * 4 = insufficient BNB
+     * 5 = cooldown active
+     * 6 = lifetime cap reached
+     * 7 = faucet balance below required payout
+     */
+    function canClaim(address user)
+        external
+        view
+        returns (
+            bool ok,
+            uint8 reasonCode,
+            uint256 nextClaimAt,
+            uint256 remainingCap
+        )
+    {
+        uint256 remainingCap_ = _remainingCap(user);
+
+        if (paused) {
+            return (false, CLAIM_ERR_PAUSED, 0, remainingCap_);
+        }
+
+        if (blacklisted[user]) {
+            return (false, CLAIM_ERR_BLACKLISTED, 0, remainingCap_);
+        }
+
+        if (onlyEOA && user.code.length != 0) {
+            return (false, CLAIM_ERR_ONLY_EOA, 0, remainingCap_);
+        }
+
+        if (user.balance < MIN_BNB_BALANCE) {
+            return (false, CLAIM_ERR_BNB, 0, remainingCap_);
+        }
+
+        uint256 last = lastClaimed[user];
+        nextClaimAt = last + uint256(cooldown);
+
+        if (block.timestamp < nextClaimAt) {
+            return (false, CLAIM_ERR_COOLDOWN, nextClaimAt, remainingCap_);
+        }
+
+        if (remainingCap_ == 0) {
+            return (false, CLAIM_ERR_LIFETIME_CAP, nextClaimAt, 0);
+        }
+
+        uint256 minPayout = uint256(minTokenCount) * CLAIM_UNIT;
+        uint256 requiredBalance = remainingCap_ < minPayout ? remainingCap_ : minPayout;
+
+        if (requiredBalance == 0) {
+            return (false, CLAIM_ERR_LIFETIME_CAP, nextClaimAt, 0);
+        }
+
+        if (token.balanceOf(address(this)) < requiredBalance) {
+            return (false, CLAIM_ERR_FAUCET_BALANCE, nextClaimAt, remainingCap_);
+        }
+
+        return (true, CLAIM_OK, nextClaimAt, remainingCap_);
+    }
+
+    /**
+     * @notice Returns the remaining cooldown time in seconds.
+     * @return Remaining seconds until the next eligible claim.
+     */
+    function timeUntilNextClaim(address user) external view returns (uint256) {
+        uint256 nextClaimAt = lastClaimed[user] + uint256(cooldown);
+        if (block.timestamp >= nextClaimAt) return 0;
+        return nextClaimAt - block.timestamp;
+    }
+
+    /**
+     * @notice Returns the user's remaining lifetime claim allowance.
+     */
+    function remainingLifetimeCap(address user) external view returns (uint256) {
+        return _remainingCap(user);
+    }
+
+    // -------------------------------------------------------------------------
+    // Owner controls
+    // -------------------------------------------------------------------------
+
+    /**
+     * @notice Updates the claim cooldown.
+     */
+    function setCooldown(uint40 _cooldown) external onlyOwner {
+        if (_cooldown == 0 || _cooldown > MAX_COOLDOWN) revert InvalidCooldown();
+        cooldown = _cooldown;
+        emit CooldownUpdated(_cooldown);
+    }
+
+    /**
+     * @notice Updates the payout range in 0.01-token units.
+     * @dev Example: 500 = 5.00, 1250 = 12.50.
+     */
+    function setTokenCountRange(uint16 _minTokens, uint16 _maxTokens) external onlyOwner {
+        if (_minTokens == 0 || _maxTokens < _minTokens) revert InvalidRange();
+        minTokenCount = _minTokens;
+        maxTokenCount = _maxTokens;
+        emit TokenCountRangeUpdated(_minTokens, _maxTokens);
+    }
+
+    /**
+     * @notice Pauses or unpauses claim execution.
+     */
+    function setPaused(bool _paused) external onlyOwner {
+        paused = _paused;
+        emit PausedUpdated(_paused);
+    }
+
+    /**
+     * @notice Enables or disables EOA-only claim mode.
+     */
+    function setOnlyEOA(bool _onlyEOA) external onlyOwner {
+        onlyEOA = _onlyEOA;
+        emit OnlyEOAUpdated(_onlyEOA);
+    }
+
+    /**
+     * @notice Updates blacklist status for a user.
+     */
+    function setBlacklist(address user, bool isBlacklisted) external onlyOwner {
+        if (user == address(0)) revert ZeroAddress();
+        blacklisted[user] = isBlacklisted;
+        emit BlacklistUpdated(user, isBlacklisted);
+    }
+
+    /**
+     * @notice Funds the faucet with XOX.
+     * @dev Requires prior token approval.
+     */
+    function depositToken(uint256 amount) external onlyOwner {
+        if (amount == 0) revert ZeroAmount();
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        emit TokensDeposited(msg.sender, amount);
+    }
+
+    /**
+     * @notice Withdraws XOX from the faucet.
+     */
+    function withdrawToken(address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        token.safeTransfer(to, amount);
+        emit TokensWithdrawn(to, amount);
+    }
+
+    /**
+     * @notice Recovers non-XOX ERC20 tokens sent to the faucet by mistake.
+     */
+    function emergencyRecoverERC20(address tokenAddress, address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        if (tokenAddress == address(token)) revert MainTokenRecoveryNotAllowed();
+        if (amount == 0) revert ZeroAmount();
+
+        IERC20(tokenAddress).safeTransfer(to, amount);
+        emit EmergencyTokenRecovered(tokenAddress, to, amount);
+    }
+
+    /**
+     * @notice Withdraws stray BNB held by the faucet.
+     * @dev Uses low-level call instead of transfer.
+     */
+    function emergencyWithdrawBNB(address payable to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+
+        (bool ok, ) = to.call{value: amount}("");
+        if (!ok) revert BNBTransferFailed();
+
+        emit EmergencyBNBWithdrawn(to, amount);
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * @dev Returns a pseudo-random payout value in raw 0.01-token units.
+     * @dev This is not secure randomness.
+     */
+    function _randomTokenCount(address user, uint256 last) internal view returns (uint256) {
+        uint256 range = uint256(maxTokenCount) - uint256(minTokenCount) + 1;
+
+        uint256 rand = uint256(
+            keccak256(
+                abi.encodePacked(
+                    user,
+                    block.timestamp,
+                    blockhash(block.number - 1),
+                    last
+                )
+            )
+        );
+
+        return uint256(minTokenCount) + (rand % range);
+    }
+
+    /**
+     * @dev Returns the remaining lifetime cap for a user.
+     */
+    function _remainingCap(address user) internal view returns (uint256) {
+        uint256 claimed = totalClaimedByUser[user];
+        if (claimed >= LIFETIME_CAP) return 0;
+        return LIFETIME_CAP - claimed;
+    }
+
+    /**
+     * @notice Accepts native BNB transfers.
+     */
+    receive() external payable {}
+}
